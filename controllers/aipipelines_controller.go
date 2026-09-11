@@ -50,6 +50,13 @@ type dspoDeploymentObservation struct {
 	Message string
 }
 
+type platformConfigObservation struct {
+	Status  metav1.ConditionStatus
+	Reason  string
+	Message string
+	Version string
+}
+
 // AIPipelinesReconciler reconciles the singleton AIPipelines module CR. It is
 // the only controller that writes AIPipelines.status; subordinate controllers
 // expose readiness through the resources this reconciler observes.
@@ -64,6 +71,7 @@ type AIPipelinesReconciler struct {
 // +kubebuilder:rbac:groups=components.platform.opendatahub.io,resources=aipipelines,verbs=get;list;watch
 // +kubebuilder:rbac:groups=components.platform.opendatahub.io,resources=aipipelines/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
 
 func (r *AIPipelinesReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	module := &aipipelinesv1alpha1.AIPipelines{}
@@ -77,7 +85,8 @@ func (r *AIPipelinesReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 	dspo := observeDSPODeployment(ctx, reader, r.Namespace)
 	argo := observeArgoLifecycle(ctx, reader, r.Namespace, module.Spec.ArgoWorkflowsControllersManagementState())
-	desired := buildAIPipelinesStatus(module, dspo, argo)
+	platformConfig := observePlatformConfig(ctx, reader)
+	desired := buildAIPipelinesStatus(module, dspo, argo, platformConfig)
 	if apiequality.Semantic.DeepEqual(module.Status, desired) {
 		return ctrl.Result{}, nil
 	}
@@ -104,6 +113,17 @@ func (r *AIPipelinesReconciler) SetupWithManager(mgr ctrl.Manager) error {
 					Name: aipipelinesv1alpha1.AIPipelinesInstanceName,
 				}}}
 			}),
+		).
+		Watches(
+			&corev1.ConfigMap{},
+			handler.EnqueueRequestsFromMapFunc(func(_ context.Context, object client.Object) []reconcile.Request {
+				if !isPlatformConfigMap(object) {
+					return nil
+				}
+				return []reconcile.Request{{NamespacedName: types.NamespacedName{
+					Name: aipipelinesv1alpha1.AIPipelinesInstanceName,
+				}}}
+			}),
 		)
 	if err := watchArgoAssets(b, r.Namespace); err != nil {
 		return err
@@ -115,12 +135,22 @@ func buildAIPipelinesStatus(
 	module *aipipelinesv1alpha1.AIPipelines,
 	dspoObservation dspoDeploymentObservation,
 	argoObservation argoLifecycleObservation,
+	platformObservations ...platformConfigObservation,
 ) aipipelinesv1alpha1.AIPipelinesStatus {
 	configurationStatus, configurationReason, configurationMessage := validateAIPipelinesConfiguration(module)
 	dspoStatus, dspoReason, dspoMessage := dspoObservation.Status, dspoObservation.Reason, dspoObservation.Message
 	argoStatus, argoReason, argoMessage := argoObservation.Status, argoObservation.Reason, argoObservation.Message
+	platformConfig := platformConfigObservation{
+		Status:  metav1.ConditionTrue,
+		Reason:  "StandaloneConfiguration",
+		Message: "Using standalone operator configuration",
+		Version: config.ResolvedPlatformVersion(),
+	}
+	if len(platformObservations) > 0 {
+		platformConfig = platformObservations[0]
+	}
 
-	readyStatus := aggregateConditionStatuses(configurationStatus, dspoStatus, argoStatus)
+	readyStatus := aggregateConditionStatuses(configurationStatus, platformConfig.Status, dspoStatus, argoStatus)
 	readyReason := "Ready"
 	readyMessage := "AIPipelines is ready"
 	if readyStatus != metav1.ConditionTrue {
@@ -128,12 +158,15 @@ func buildAIPipelinesStatus(
 		readyMessage = "AIPipelines is waiting for configuration, DSPO, or Argo readiness"
 	}
 
-	provisioningStatus := configurationStatus
+	provisioningStatus := aggregateConditionStatuses(configurationStatus, platformConfig.Status)
 	provisioningReason := "ConfigurationAccepted"
 	provisioningMessage := "AIPipelines configuration was accepted"
 	if provisioningStatus != metav1.ConditionTrue {
 		provisioningReason = "InvalidConfiguration"
 		provisioningMessage = configurationMessage
+		if configurationStatus == metav1.ConditionTrue {
+			provisioningMessage = platformConfig.Message
+		}
 	}
 
 	status := aipipelinesv1alpha1.AIPipelinesStatus{}
@@ -146,15 +179,33 @@ func buildAIPipelinesStatus(
 		moduleCondition(module, common.ConditionTypeReady, readyStatus, readyReason, readyMessage),
 		moduleCondition(module, common.ConditionTypeProvisioningSucceeded, provisioningStatus, provisioningReason, provisioningMessage),
 		moduleCondition(module, common.ConditionType(conditionTypeConfigurationValid), configurationStatus, configurationReason, configurationMessage),
+		moduleCondition(module, common.ConditionType("PlatformConfigurationValid"), platformConfig.Status, platformConfig.Reason, platformConfig.Message),
 		moduleCondition(module, common.ConditionType(conditionTypeDSPOReady), dspoStatus, dspoReason, dspoMessage),
 		moduleCondition(module, common.ConditionType(conditionTypeArgoReady), argoStatus, argoReason, argoMessage),
 	}
 
-	if platformVersion := config.ResolvedPlatformVersion(); platformVersion != "" {
-		status.SetPlatformRelease(platformVersion)
+	if platformConfig.Status == metav1.ConditionTrue && platformConfig.Version != "" {
+		status.SetPlatformRelease(platformConfig.Version)
 	}
 
 	return status
+}
+
+func observePlatformConfig(ctx context.Context, reader client.Reader) platformConfigObservation {
+	version, err := resolvePlatformVersion(ctx, reader)
+	if err != nil {
+		return platformConfigObservation{
+			Status:  metav1.ConditionFalse,
+			Reason:  "PlatformConfigurationUnavailable",
+			Message: err.Error(),
+		}
+	}
+	return platformConfigObservation{
+		Status:  metav1.ConditionTrue,
+		Reason:  "PlatformConfigurationAvailable",
+		Message: "Platform configuration is available",
+		Version: version,
+	}
 }
 
 func validateAIPipelinesConfiguration(module *aipipelinesv1alpha1.AIPipelines) (metav1.ConditionStatus, string, string) {

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package argo
+package argo //nolint:testpackage // asset count intentionally validates the private embedded manifest list
 
 import (
 	"testing"
