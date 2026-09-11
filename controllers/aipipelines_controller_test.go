@@ -146,8 +146,9 @@ func TestBuildAIPipelinesStatusPreservesTransitionTime(t *testing.T) {
 }
 
 func TestAIPipelinesReconcileUpdatesStatus(t *testing.T) {
-	viper.Set("DSPO.PlatformVersion", "v3.6.0")
+	viper.Set(config.EnableAIPipelinesModuleControllerConfigName, true)
 	t.Cleanup(viper.Reset)
+	t.Setenv(applicationsNamespaceEnv, "opendatahub")
 
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
@@ -161,10 +162,14 @@ func TestAIPipelinesReconcileUpdatesStatus(t *testing.T) {
 			Conditions:         []appsv1.DeploymentCondition{{Type: appsv1.DeploymentAvailable, Status: corev1.ConditionTrue}},
 		},
 	}
+	platformConfig := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: platformConfigMapName, Namespace: "opendatahub"},
+		Data:       map[string]string{platformVersionKey: "3.6.0"},
+	}
 	client := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(&aipipelinesv1alpha1.AIPipelines{}).
-		WithObjects(module, dspoDeployment).
+		WithObjects(module, dspoDeployment, platformConfig).
 		Build()
 	assets, err := argoassets.Objects("opendatahub")
 	require.NoError(t, err)
@@ -194,7 +199,8 @@ func TestAIPipelinesReconcileUpdatesStatus(t *testing.T) {
 	updated := &aipipelinesv1alpha1.AIPipelines{}
 	require.NoError(t, client.Get(context.Background(), types.NamespacedName{Name: module.Name}, updated))
 	require.Equal(t, common.PhaseReady, updated.Status.Phase)
-	require.Equal(t, "v3.6.0", updated.Status.GetPlatformRelease())
+	require.Equal(t, "3.6.0", updated.Status.GetPlatformRelease())
+	require.Equal(t, metav1.ConditionTrue, requireModuleCondition(t, updated.Status.Conditions, "PlatformConfigurationValid").Status)
 }
 
 func TestAIPipelinesReconcileIgnoresNonSingleton(t *testing.T) {
